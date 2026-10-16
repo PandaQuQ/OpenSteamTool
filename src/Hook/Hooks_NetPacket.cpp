@@ -6,6 +6,8 @@
 #include "Utils/Tickets/AppTicket.h"
 #include "Utils/Support/FnvHash.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
+#include "OSTPlatform/include/Memory.h"
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -15,6 +17,126 @@
 #include <vector>
 
 #include "steam_messages.pb.h"
+
+// ════════════════════════════════════════════════════════════════
+//  CNetPacket field access (layout detected at runtime)
+// ════════════════════════════════════════════════════════════════
+//  See the table above `struct CNetPacket;` in Steam/Structs.h. Steam build
+//  1791918634 shifted m_pubData/m_cubData by +8, so a compiled-in layout reads
+//  a garbage pointer on one client or the other. Instead the first packet that
+//  reaches hkRecvPkt is probed against every known layout; the hook only
+//  touches packets once exactly one layout matches. Until then, or if no layout
+//  can be identified, packets go straight to the original untouched.
+namespace NetPkt {
+
+    struct Layout {
+        const char* name;
+        uint32_t    dataOff;   // m_cubData always sits at dataOff + 8
+    };
+
+    // Valve will shift this again; a new row should be the whole change.
+    inline constexpr Layout kLayouts[] = {
+        { "legacy",     0x08 },
+        { "1791918634+", 0x10 },
+    };
+
+    inline constexpr uint32_t kUnresolved     = 0u;
+    inline constexpr uint32_t kDisabled       = 0xFFFFFFFFu;
+    inline constexpr uint32_t kMaxProbes      = 256;            // packets to try before giving up
+    inline constexpr uint32_t kMaxProbeSize   = 64u * 1024 * 1024;
+    inline constexpr uint32_t kCubExtendedHdr = 36;             // sizeof(ExtendedMsgHdr)
+    static_assert(sizeof(ExtendedMsgHdr) == kCubExtendedHdr);
+
+    // Whole layout state in one word, so it can never be observed half-written.
+    constinit std::atomic<uint32_t> g_dataOff{ kUnresolved };
+    std::atomic<uint32_t> g_probes{ 0 };
+
+    // Discard sinks returned while the layout is unknown. Every real call site
+    // sits behind the Resolve() gate in hkRecvPkt; these only make a call added
+    // above the gate harmless instead of a wild write into a Steam object.
+    uint8* g_trashData = nullptr;
+    uint32 g_trashSize = 0;
+
+    inline uint32_t State() { return g_dataOff.load(std::memory_order_relaxed); }
+
+    inline uint8*& Data(CNetPacket* p) {
+        const uint32_t off = State();
+        if (!p || off == kUnresolved || off == kDisabled) return g_trashData;
+        return *reinterpret_cast<uint8**>(reinterpret_cast<uint8*>(p) + off);
+    }
+
+    inline uint32& Size(CNetPacket* p) {
+        const uint32_t off = State();
+        if (!p || off == kUnresolved || off == kDisabled) return g_trashSize;
+        return *reinterpret_cast<uint32*>(reinterpret_cast<uint8*>(p) + off + 8);
+    }
+
+    // Does (data, size) look like a real CM message buffer?
+    bool LooksLikePacket(const uint8* data, uint32 size) {
+        if (reinterpret_cast<uintptr_t>(data) < 0x10000) return false;
+        if (size < sizeof(MsgHdr) || size > kMaxProbeSize) return false;
+        if (!OSTPlatform::Memory::IsReadable(data, size)) return false;
+
+        uint32 rawEMsg = 0;
+        std::memcpy(&rawEMsg, data, sizeof(rawEMsg));
+        if (rawEMsg & kMsgHdrProtoFlag) {
+            uint32 cbHdr = 0;
+            std::memcpy(&cbHdr, data + 4, sizeof(cbHdr));
+            return cbHdr <= size - sizeof(MsgHdr);
+        }
+        // Non-protobuf messages carry an ExtendedMsgHdr whose m_nCubHdr is 36.
+        return size >= kCubExtendedHdr && data[4] == kCubExtendedHdr;
+    }
+
+    // Returns true once the layout is known. Never touches the packet beyond
+    // reading candidate fields.
+    bool Resolve(CNetPacket* p) {
+        const uint32_t state = State();
+        if (state == kDisabled) return false;
+        if (state != kUnresolved) return p != nullptr;
+        if (!p) return false;
+
+        // Every candidate's fields lie within the first 0x20 bytes, which both
+        // layouts have.
+        if (!OSTPlatform::Memory::IsReadable(p, 0x20)) return false;
+
+        const Layout* match = nullptr;
+        int matches = 0;
+        for (const Layout& layout : kLayouts) {
+            uint8* data = nullptr;
+            uint32 size = 0;
+            std::memcpy(&data, reinterpret_cast<const uint8*>(p) + layout.dataOff, sizeof(data));
+            std::memcpy(&size, reinterpret_cast<const uint8*>(p) + layout.dataOff + 8, sizeof(size));
+            if (LooksLikePacket(data, size)) {
+                match = &layout;
+                ++matches;
+            }
+        }
+
+        if (matches == 1) {
+            uint32_t expected = kUnresolved;
+            g_dataOff.compare_exchange_strong(expected, match->dataOff, std::memory_order_relaxed);
+            LOG_NETPACKET_INFO("CNetPacket layout detected: {} (m_pubData @ +0x{:X})",
+                               match->name, match->dataOff);
+            return State() != kDisabled;
+        }
+
+        const uint32_t n = g_probes.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n >= kMaxProbes) {
+            uint32_t expected = kUnresolved;
+            if (g_dataOff.compare_exchange_strong(expected, kDisabled, std::memory_order_relaxed)) {
+                LOG_NETPACKET_WARN("CNetPacket layout could not be identified after {} packets; "
+                                   "RecvPkt hook now passes every packet through untouched "
+                                   "(incoming packet patching disabled for this Steam build)", n);
+            }
+        } else {
+            LOG_NETPACKET_DEBUG("CNetPacket layout probe inconclusive ({} candidate(s) matched), "
+                                "passing packet through", matches);
+        }
+        return false;
+    }
+
+} // namespace NetPkt
 
 // ════════════════════════════════════════════════════════════════
 //  Shared infrastructure
@@ -59,7 +181,8 @@ namespace {
                           EMsg& eMsg, const uint8*& pHdr, uint32& cbHdr,
                           const uint8*& pBody, uint32& cbBody)
     {
-        if (!data || size < sizeof(MsgHdr)) {
+        if (!data || reinterpret_cast<uintptr_t>(data) < 0x10000 ||
+            size < sizeof(MsgHdr)) {
         fail:
             eMsg = static_cast<EMsg>(0);
             cbHdr = 0;
@@ -90,15 +213,15 @@ namespace {
         if (newSize > sizeof(g_RecvPacketPool[0])) return;
 
         uint8* buf = g_RecvPacketPool[g_RecvPacketPoolIdx];
-        const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(p->m_pubData);
+        const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(NetPkt::Data(p));
         MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
         out->eMsg         = orig->eMsg;
         out->headerLength = cbNewHdr;
         memcpy(buf + sizeof(MsgHdr), pNewHdr, cbNewHdr);
         if (cbNewBody)
             memcpy(buf + sizeof(MsgHdr) + cbNewHdr, pNewBody, cbNewBody);
-        p->m_pubData = buf;
-        p->m_cubData = newSize;
+        NetPkt::Data(p) = buf;
+        NetPkt::Size(p) = newSize;
 
         g_RecvPacketPoolIdx = (g_RecvPacketPoolIdx + 1) % kPacketPoolSize;
     }
@@ -871,13 +994,13 @@ namespace Hooks_NetPacket_RichPresence {
         if (!g_InjectPending || g_cbInjectPkt == 0) return;
         g_InjectPending = false;
 
-        uint8* origData = pCarrier->m_pubData;
-        uint32 origSize = pCarrier->m_cubData;
-        pCarrier->m_pubData = g_InjectPkt;
-        pCarrier->m_cubData = g_cbInjectPkt;
+        uint8* origData = NetPkt::Data(pCarrier);
+        uint32 origSize = NetPkt::Size(pCarrier);
+        NetPkt::Data(pCarrier) = g_InjectPkt;
+        NetPkt::Size(pCarrier) = g_cbInjectPkt;
         invokeOriginal(pThis, pCarrier);
-        pCarrier->m_pubData = origData;
-        pCarrier->m_cubData = origSize;
+        NetPkt::Data(pCarrier) = origData;
+        NetPkt::Size(pCarrier) = origSize;
         LOG_RICHPRESENCE_INFO("Delivered manufactured self-PersonaState ({} bytes)", g_cbInjectPkt);
     }
 
@@ -1104,13 +1227,13 @@ namespace Hooks_NetPacket_Cloud {
                 g_pending.pop_front();
             }
 
-            uint8* origData = pCarrier->m_pubData;
-            uint32 origSize = pCarrier->m_cubData;
-            pCarrier->m_pubData = pkt.data();
-            pCarrier->m_cubData = static_cast<uint32>(pkt.size());
+            uint8* origData = NetPkt::Data(pCarrier);
+            uint32 origSize = NetPkt::Size(pCarrier);
+            NetPkt::Data(pCarrier) = pkt.data();
+            NetPkt::Size(pCarrier) = static_cast<uint32>(pkt.size());
             invokeOriginal(pThis, pCarrier);
-            pCarrier->m_pubData = origData;
-            pCarrier->m_cubData = origSize;
+            NetPkt::Data(pCarrier) = origData;
+            NetPkt::Size(pCarrier) = origSize;
             LOG_NETPACKET_DEBUG("Cloud: delivered {}-byte response", pkt.size());
         }
     }
@@ -1318,6 +1441,11 @@ namespace {
 
     HOOK_FUNC(RecvPkt, void*, void* pThis, CNetPacket* pPacket)
     {
+        // Layout unknown (still probing, or unidentifiable on this Steam
+        // build): hand the packet to Steam without reading or writing it.
+        if (!NetPkt::Resolve(pPacket))
+            return oRecvPkt(pThis, pPacket);
+
         Hooks_NetPacket_RichPresence::TryInject(
             pThis, pPacket,
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
@@ -1329,7 +1457,7 @@ namespace {
         EMsg eMsg;
         const uint8 *pBody, *pHdr;
         uint32 cbBody, cbHdr;
-        if (UnpackRaw(pPacket->m_pubData, pPacket->m_cubData,
+        if (UnpackRaw(NetPkt::Data(pPacket), NetPkt::Size(pPacket),
                      eMsg, pHdr, cbHdr, pBody, cbBody)) {
             g_ResizedInPlace = false;
             RecvJob(eMsg, pBody, cbBody, pHdr, cbHdr);
@@ -1340,7 +1468,7 @@ namespace {
                     g_NewHdr, g_cbNewHdr,
                     pBody, g_NewBodySize);
             } else if (g_ResizedInPlace) {
-                pPacket->m_cubData = sizeof(MsgHdr) + cbHdr + g_NewBodySize;
+                NetPkt::Size(pPacket) = sizeof(MsgHdr) + cbHdr + g_NewBodySize;
             } else if (g_NeedReplaceHdr || g_NeedReplaceBody) {
                 ReplaceRecvPacket(pPacket,
                     g_NeedReplaceHdr  ? g_NewHdr  : pHdr,

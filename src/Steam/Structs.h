@@ -206,15 +206,24 @@ struct IKeyValuesSystem {
 };
 using KeyValuesSystemSteam_t = IKeyValuesSystem* (*)();
 
-struct CNetPacket
-{
-	HCONNECTION m_hConnection;
-	uint8* m_pubData;
-	uint32 m_cubData;
-	int32 m_cRef;
-	uint8* m_pubNetworkBuffer;
-	CNetPacket* m_pNext;
-};
+// CNetPacket's layout differs between Steam client builds, so it is opaque:
+// never declare its fields and never take its sizeof. Hooks_NetPacket.cpp reads
+// m_pubData / m_cubData through NetPkt::Data() / NetPkt::Size(), which apply an
+// offset detected at runtime from a live packet.
+//
+//   field                legacy      1791918634+ (stable 2026-10-13)
+//   m_hConnection        +0x00       +0x00
+//   (new uint32 x2)      --          +0x04, +0x08  (+4 bytes padding @ +0x0C)
+//   m_pubData            +0x08       +0x10
+//   m_cubData            +0x10       +0x18
+//   m_cRef               +0x14       +0x1C
+//   m_pubNetworkBuffer   +0x18       +0x20
+//   m_pNext              +0x20       +0x28
+//
+// Confirmed against steamclient64.dll e9045710...: RecvPkt (RVA 0x5BC990) hands
+// the packet to the message factory at RVA 0xD24E40, which reads the payload
+// pointer from [pkt+0x10] and its length from [pkt+0x18].
+struct CNetPacket;
 
 struct MsgHdr
 {
